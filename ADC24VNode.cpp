@@ -10,19 +10,59 @@ ADC24VNode::ADC24VNode(const char *id, const char *name, const char *nType, cons
 {
 }
 
-/*
-  * Voltage divider analog in pins
-  * https://dl.espressif.com/doc/esp-idf/latest/api-reference/peripherals/adc.html
-  * set up A:D channels and attenuation
-  *   * Read the sensor by
-  *   * uint16_t value =  adc1_get_raw(ADC1_CHANNEL_0);
-  *  150mv-3.9vdc inside 0-4095 range   (constrained by 3.3vdc supply)
-*/
-void ADC24VNode::initializeADC()
+/**
+ * true is broken
+ * false is closed
+ */
+bool ADC24VNode::isBeamBroken()
 {
-  adc1_config_width(ADC_WIDTH_12Bit);
-  adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_11); // Pin 36
-  taskYIELD();
+  return _adcStatus;
+}
+
+/**
+ * actual
+ */
+double ADC24VNode::getBeamVoltage()
+{
+  return _adcVoltage;
+}
+
+/*
+ * Utility to handle Duration Roll Overs
+*/
+unsigned long setDuration(unsigned long duration)
+{
+  unsigned long value = millis() + duration;
+  if (value < duration)
+  { // rolled
+    value = duration;
+  }
+  return value;
+}
+
+/**
+ * - Value ranges from 18.5 to 20.5
+*/
+double ADC24VNode::sknAdcToVolts(int value)
+{
+  if (value < 1 || value > 4095)
+  {
+    return 1.0;
+  }
+
+  double reading = value * 1.0; // Reference voltage is 3v3 so maximum reading is 3v3 = 4095 in range 0 to 4095
+
+  reading = -0.000000000000016 * pow(reading, 4) + 0.000000000118171 * pow(reading, 3) - 0.000000301211691 * pow(reading, 2) + 0.001109019271794 * reading + 0.034143524634089;
+  return ((reading + ENTRY_VOLTAGE_BASE) * 10.0); // scale to d.dd
+}
+
+/**
+ *
+ */
+double ADC24VNode::readADC()
+{
+  _adcVoltage = sknAdcToVolts( adc1_get_raw(ADC1_CHANNEL_0) );
+  return _adcVoltage;
 }
 
 /**
@@ -30,66 +70,81 @@ void ADC24VNode::initializeADC()
  */
 void ADC24VNode::onReadyToOperate() { 
     Homie.getLogger() << cCaption << endl;
-    Homie.getLogger() << cIndent << "onReadyToOperate()" << endl;
+    Homie.getLogger() << cIndent << getName() << " onReadyToOperate(): volts=" << readADC() << endl;
 }
 
 /**
- * Called by Homie when Homie.setup() is called; Once!
+ * Called by Homie during Homie.setup() is called; Once!
+ * 
+ * Voltage divider analog in pins
+ * https://dl.espressif.com/doc/esp-idf/latest/api-reference/peripherals/adc.html
+ * set up A:D channels and attenuation
+ *   * Read the sensor by
+ *   * uint16_t value =  adc1_get_raw(ADC1_CHANNEL_0);
+ *  150mv-3.9vdc inside 0-4095 range   (constrained by 3.3vdc supply)
 */
-void ADC24VNode::setup() {
-  Homie.getLogger() << cCaption << endl;
-  Homie.getLogger() << cIndent << cPropertyName << endl;
-
+void ADC24VNode::setup()
+{
   pinMode(_pinADC, INPUT);
 
-  advertise(cProperty)
-      .setName(cPropertyName)
-      .setDatatype(cPropertyDataType)
-      .setFormat(cPropertyFormat);
-      // .setUnit(cPropertyUnit);
-  advertise(cProperty)
-      .setName(cPropertyName)
-      .setDatatype(cPropertyDataType)
-      .setFormat(cPropertyFormat);
-  // .setUnit(cPropertyUnit);
+  adc1_config_width(ADC_WIDTH_12Bit);
+  adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_11); // Pin 36
+
+  readADC(); // side effect of setting _adcVoltage
+
+  advertise(cPropertyStatus)
+    .setName(cPropertyStatusName)
+    .setDatatype(cPropertyStatusDataType)
+    .setFormat(cPropertyStatusFormat)
+    .setUnit(cPropertyStatusUnit);
+
+  advertise(cPropertyVoltage)
+    .setName(cPropertyVoltageName)
+    .setDatatype(cPropertyVoltageDataType)
+    .setFormat(cPropertyVoltageFormat)
+    .setUnit(cPropertyVoltageUnit);
+
+  ulTriggerbase = millis();
 }
 
 /**
  * Called by Homie when homie is connected and in run mode
 */
 void ADC24VNode::loop() {
-  _isrTrigger = digitalRead(_pinADC);
+  ulTriggerBase = millis();
+  ulElapsed = ulTriggerBase - ulLastTriggerBase;
 
-  if (_isrTrigger == HIGH) {
-    _isrTriggeredAt = millis(); // push hold time
+  if (ulElapsed >= ulTriggerCycle) // sample
+  {
+    readADC();
 
-    if (!_motion)
+    Homie.getLogger() << cIndent 
+                      << "✖ SafetyBeam: " << getName()
+                      << " Volts: " << _adcVoltage
+                      << endl;
+
+    if (_adcVoltage >= _threashold)
     {
-      _motion = true;
-
-      Homie.getLogger() << F("〽 Sending Presence: ") << endl;
-
-      Homie.getLogger() << cIndent
-                        << F("✖ Motion Detected: ON ")
-                        << endl;
-
-      setProperty(cProperty).setRetained(true).send("ON");
+      if (!bTriggered) 
+      { // ON
+        snprintf(buffer, sizeof(buffer), cPropertyVoltageFormat, _adcVoltage);
+        setProperty(cPropertyStatus).send("OPEN");
+        setProperty(cPropertyVoltage).send(buffer);
+      }
+      ulTriggerDuration = setDuration(ulTriggerHold);
+      bTriggered = true;  
     }
+
+    ulLastTriggerBase = ulTriggerBase;
   }
 
-  if (_isrTriggeredAt != 0 ) {
-    if (_motion && ((millis() - _isrTriggeredAt) >= (_motionHoldInterval * 1000UL))) {
-      // hold time expired
+  if (bTriggered && (ulTriggerBase >= ulTriggerDuration))
+  { // OFF                     
+    bTriggered = false;
 
-      _motion = false;          // re-enable motion
-      _isrTriggeredAt = 0;
-
-      Homie.getLogger() << cIndent
-                        << F("✖ Motion Detected: OFF ")
-                        << endl;
-
-      setProperty(cProperty).setRetained(true).send("OFF");
-    }
+    snprintf(buffer, sizeof(buffer), cPropertyVoltageFormat, _adcVoltage);
+    setProperty(cPropertyStatus).send("CLOSED");
+    setProperty(cPropertyVoltage).send(buffer);
   }
 }
 

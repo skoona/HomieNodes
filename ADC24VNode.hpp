@@ -31,8 +31,8 @@ class ADC24VNode : public HomieNode {
 public:
   ADC24VNode(const char *id, const char *name, const char *nType, const uint8_t adcPin);
 
-  void setMotionHoldInterval(unsigned long interval) { _motionHoldInterval = interval; }
-  unsigned long getMotionHoldInterval() const { return _motionHoldInterval; }
+  bool isBeamBroken();
+  double getBeamVoltage();
 
 protected:
   virtual void setup() override;
@@ -40,30 +40,39 @@ protected:
   virtual void onReadyToOperate() override;
   
 private:
-  // suggested rate is 1/60Hz (1m)
-  static const int MIN_INTERVAL  = 10;  // in seconds
-  static const int HOLD_INTERVAL = 60;
+  int _pinADC;
+  char buffer[32];
 
-  const char *cCaption = "• RCWL-0516 Doppler Radar Microwave Motion Sensor:";
+  const char *cCaption = "• ESP32 ADC Measurements";
   const char* cIndent  = "  ◦ ";
 
-  // Motion Node Properties
-  int _pinADC;
+  // ADC Node Properties
   const char *cPropertyStatus = "beamstatus";
   const char *cPropertyStatusName = "Safety Beam Status";
   const char *cPropertyStatusDataType = "enum";
   const char *cPropertyStatusFormat = "OPEN,CLOSED";
   const char *cPropertyStatusUnit = "#";
 
-  const char *cPropertyVoltage = "safetybeam";
+  const char *cPropertyVoltage = "beamvoltage";
   const char *cPropertyVoltageName = "Saftey Beam Volts";
   const char *cPropertyVoltageDataType = "float";
   const char *cPropertyVoltageFormat = "%03.1f";
   const char *cPropertyVoltageUnit = "vdc";
 
-  volatile bool  _adcStatus = false;
-  volatile float _adcVoltage = 0.0;
-  volatile float _threashold = 19.5;
+  volatile bool  _adcStatus = false; // open(broken=true), close
+  volatile double _adcVoltage = 0.0;
+  volatile double _threashold = 19.5;
+
+  bool bTriggered = false;
+
+  unsigned long ulTriggerBase = 0,     // baseline
+                ulLastTriggerBase = 0, // increase 
+                ulTriggerHold = 20000, // ms = 20 secs
+                ulTriggerCycle = 500,  // sample rate
+                ulTriggerDuration = 0, // hold time once triggered
+                ulElapsed = 0;
   
   void initializeADC();
-};
+  double sknAdcToVolts(int value);
+  double readADC();
+}
